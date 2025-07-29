@@ -70,13 +70,6 @@ jupyter notebook
 - **xgboost**: For gradient boosting models
 - **ucimlrepo**: For fetching datasets from the UCI Machine Learning Repository
 
-## Future Work
-
-- Add more datasets and optimization problems
-- Implement additional machine learning models
-- Explore more advanced Bayesian optimization techniques
-- Add interactive visualizations
-
 ## License
 
 This project is open source and available under the [MIT License](LICENSE).
