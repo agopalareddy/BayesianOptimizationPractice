@@ -350,12 +350,251 @@ for i, param in enumerate(best_params_xgb):
     print(f"{X_train.columns[i]}: {param}")
 print(f"Best predicted quality using XGBoost: {best_quality_xgb}")
 #%% md
-# # Conclusion
-# 
-# In this notebook, I have demonstrated how to perform Bayesian optimization on a wine quality dataset using both Random Forest and XGBoost models. The process involved:
-# 1. Fetching the dataset and preparing it for analysis.
-# 2. Conducting exploratory data analysis (EDA) to understand the data.
-# 3. Implementing Bayesian optimization to find the best hyperparameters for the models.
-# 4. Evaluating the optimized models on a test set.
-# 5. Using the optimized models to predict wine quality based on the features.
-# The results showed that both models could effectively predict wine quality, with XGBoost providing a slightly better performance in terms of mean squared error. The best parameters found through Bayesian optimization were also displayed, allowing for further insights into the optimal conditions for wine quality prediction.
+# # Human-in-the-Loop Preference Learning for Bayesian Optimization
+#
+# In this section, we will implement a Human-in-the-Loop (HITL) approach to guide the Bayesian optimization process using preference learning. We will simulate a human expert to provide subjective feedback on wine profiles, which will be used to train a user belief model. This model will then be combined with the main surrogate model to create a more informed acquisition function.
+
+#%% md
+# ## Step 1: Simulate the Human Expert
+#
+# We begin by creating a function that simulates a human expert's preferences. This function will compare two wine profiles and indicate a preference based on their proximity to a "golden standard" profile, which we define using the best parameters found by the XGBoost optimization.
+
+#%%
+import numpy as np
+
+# Golden standard profile based on XGBoost optimization results
+golden_standard_profile = result_xgb.x
+
+def simulate_human_expert(profile1, profile2):
+    """
+    Simulates a human expert's preference between two wine profiles.
+    The preference is based on the Euclidean distance to a golden standard profile.
+
+    Args:
+        profile1 (list): The first wine profile.
+        profile2 (list): The second wine profile.
+
+    Returns:
+        int: 1 if profile1 is preferred, 0 otherwise.
+    """
+    dist1 = np.linalg.norm(np.array(profile1) - golden_standard_profile)
+    dist2 = np.linalg.norm(np.array(profile2) - golden_standard_profile)
+    if dist1 < dist2:
+        return 1  # Prefers profile1
+    else:
+        return 0  # Prefers profile2
+
+# Example usage:
+# Create two random profiles for demonstration
+random_profile1 = [X_train.iloc[0, i] for i in range(X_train.shape[1])]
+random_profile2 = [X_train.iloc[1, i] for i in range(X_train.shape[1])]
+preference = simulate_human_expert(random_profile1, random_profile2)
+print(f"Simulated expert preference: {preference}")
+#%% md
+# ## Step 2: Implement the Preference Learning Component
+#
+# Next, we implement the preference learning component. This involves generating pairs of candidate wine profiles, eliciting preferences from our simulated expert, and training a user belief model—a Gaussian Process Classifier (GPC)—on this preference data. The GPC will learn to predict the expert's preferences, which will help guide the optimization.
+
+#%%
+from sklearn.gaussian_process import GaussianProcessClassifier
+from sklearn.gaussian_process.kernels import RBF
+import warnings
+
+# Suppress warnings from GPC
+warnings.filterwarnings("ignore", category=UserWarning)
+
+
+# Initialize the user belief model (GPC)
+# A radial-basis function (RBF) kernel is a common choice
+kernel = 1.0 * RBF(length_scale=1.0)
+user_belief_model = GaussianProcessClassifier(kernel=kernel, random_state=random_state)
+
+# Generate initial preference data to train the GPC
+n_initial_pairs = 10
+preference_data = []
+preference_labels = []
+
+for _ in range(n_initial_pairs):
+    # Generate two random profiles from the search space
+    x1 = [np.random.uniform(low, high) for low, high in search_space_wine_xgb]
+    x2 = [np.random.uniform(low, high) for low, high in search_space_wine_xgb]
+
+    # Get the simulated expert's preference
+    preference = simulate_human_expert(x1, x2)
+
+    # Store the preference data
+    # We create a feature vector that is the difference between the two profiles
+    preference_data.append(np.array(x1) - np.array(x2))
+    preference_labels.append(preference)
+
+# Train the initial user belief model
+user_belief_model.fit(preference_data, preference_labels)
+
+print("Initial user belief model trained.")
+#%% md
+# ## Step 3: Modify the Bayesian Optimization Loop
+#
+# Now, we integrate the user belief model into the Bayesian optimization loop. We'll create a new acquisition function that combines the predictions from our main surrogate model (XGBoost) and the user belief model (GPC). This new function will guide the selection of candidate profiles by balancing predicted quality with the simulated expert's preferences. A custom optimization loop is implemented to accommodate this HITL approach.
+
+#%%
+from scipy.optimize import minimize
+from skopt.utils import cook_initial_point_generator
+import time
+
+# --- Configuration ---
+n_iterations = 50
+n_candidates_per_iteration = 100  # Number of random candidates to evaluate with the acquisition function
+acquisition_weight = 0.5  # Weight for combining surrogate and belief models
+
+# --- Initialization ---
+# Use the best XGBoost model as the main surrogate
+main_surrogate_model = xgb_opt.best_estimator_
+
+# Store the history of evaluated points and their objective values
+evaluated_points = []
+objective_values = []
+
+# Store the convergence history
+convergence_hitl = []
+best_quality_so_far = -np.inf
+
+# --- Custom Optimization Loop ---
+start_time = time.time()
+
+for i in range(n_iterations):
+    print(f"--- Iteration {i+1}/{n_iterations} ---")
+
+    # 1. Generate candidate profiles to evaluate with the acquisition function
+    # We'll use a simple random sampling from the search space
+    candidate_generator = cook_initial_point_generator("random")
+    candidates = candidate_generator.generate(search_space_wine_xgb, n_candidates_per_iteration)
+
+    # 2. Define and evaluate the new acquisition function for each candidate
+    def acquisition_function(x):
+        x_df = pd.DataFrame([x], columns=X_train.columns)
+
+        # a) Prediction from the main surrogate model (XGBoost)
+        # We want to maximize quality, so we take the direct prediction
+        pred_quality = main_surrogate_model.predict(x_df)[0]
+
+        # b) Prediction from the user belief model (GPC)
+        # The GPC gives the probability of a profile being "good" (preferred)
+        # We use predict_proba to get the probability of class 1 (preferred)
+        pred_preference = user_belief_model.predict_proba(np.array(x).reshape(1, -1))[0][1]
+
+        # c) Combine the two predictions (weighted average)
+        # We want to maximize this combined score
+        return acquisition_weight * pred_quality + (1 - acquisition_weight) * pred_preference
+
+    # Evaluate acquisition function for all candidates
+    acquisition_scores = [acquisition_function(c) for c in candidates]
+
+    # 3. Select the best candidate (the one that maximizes the acquisition function)
+    best_candidate_index = np.argmax(acquisition_scores)
+    next_point = candidates[best_candidate_index]
+    print(f"Selected new point to evaluate.")
+
+    # 4. Evaluate the selected point with the true objective function
+    # In a real scenario, this would be a real experiment. Here we use our objective_function_xgb.
+    true_objective_value = -objective_function_xgb(next_point) # Negate to get quality
+    print(f"True quality of new point: {true_objective_value:.4f}")
+
+    # Store the results
+    evaluated_points.append(next_point)
+    objective_values.append(true_objective_value)
+
+    # Update convergence tracking
+    if true_objective_value > best_quality_so_far:
+        best_quality_so_far = true_objective_value
+    convergence_hitl.append(best_quality_so_far)
+
+    # 5. Update the user belief model with new preference data
+    # To do this, we need a pair. We'll pair the new point with a random previous point.
+    if len(evaluated_points) > 1:
+        # Select a random point from the history to form a pair
+        random_index = np.random.randint(0, len(evaluated_points) - 1)
+        profile1 = next_point
+        profile2 = evaluated_points[random_index]
+
+        # Get simulated expert preference
+        preference = simulate_human_expert(profile1, profile2)
+
+        # Update the GPC with the new preference data
+        # The GPC expects the difference between profiles
+        if preference == 1: # Prefers profile1
+            new_data_point = np.array(profile1) - np.array(profile2)
+            new_label = 1
+        else: # Prefers profile2
+            new_data_point = np.array(profile2) - np.array(profile1)
+            new_label = 1 # The label is always 1 for the preferred profile's difference vector
+
+        # Append new data and retrain the model
+        preference_data.append(new_data_point)
+        preference_labels.append(new_label)
+        user_belief_model.fit(preference_data, preference_labels)
+        print("User belief model updated.")
+
+end_time = time.time()
+print(f"\nHITL optimization finished in {end_time - start_time:.2f} seconds.")
+
+# --- Final Results ---
+best_hitl_index = np.argmax(objective_values)
+best_params_hitl = evaluated_points[best_hitl_index]
+best_quality_hitl = objective_values[best_hitl_index]
+
+print("\nBest parameters found by HITL Bayesian optimization:")
+for i, param in enumerate(best_params_hitl):
+    print(f"{X_train.columns[i]}: {param}")
+print(f"\nBest predicted quality using HITL: {best_quality_hitl}")
+#%% md
+# ## Step 4: Final Evaluation
+#
+# Finally, we evaluate the performance of our Human-in-the-Loop (HITL) Bayesian optimization and compare it to the original XGBoost-based optimization. We will plot the convergence of both methods to see which one finds a better solution faster and compare the best wine profiles discovered by each approach.
+
+#%%
+# --- Prepare Data for Comparison ---
+# Get the convergence data from the original gp_minimize result
+# The objective function for gp_minimize returns the negative of quality, so we negate it back
+convergence_original = np.maximum.accumulate(-np.array(result_xgb.func_vals))
+
+# Ensure both convergence plots are of the same length for a fair comparison
+# We'll cap it at the number of iterations we ran for the HITL loop
+num_evaluations = min(len(convergence_hitl), len(convergence_original))
+convergence_hitl_plot = convergence_hitl[:num_evaluations]
+convergence_original_plot = convergence_original[:num_evaluations]
+
+# --- Plotting the Convergence ---
+plt.figure(figsize=(12, 8))
+plt.plot(range(1, num_evaluations + 1), convergence_hitl_plot, 'o-', label='HITL Bayesian Optimization', color='blue')
+plt.plot(range(1, num_evaluations + 1), convergence_original_plot, 's-', label='Original Bayesian Optimization (XGBoost)', color='green')
+plt.title('Convergence Comparison: HITL vs. Original Bayesian Optimization', fontsize=16)
+plt.xlabel('Number of Evaluations', fontsize=12)
+plt.ylabel('Best Quality Found So Far', fontsize=12)
+plt.legend(fontsize=12)
+plt.grid(True, which='both', linestyle='--', linewidth=0.5)
+plt.show()
+
+# --- Comparing the Best Results ---
+print("--- Comparison of Best Results ---")
+print("\nOriginal Bayesian Optimization (XGBoost):")
+print(f"  Best Quality: {best_quality_xgb:.4f}")
+print("  Best Profile:")
+for i, param in enumerate(best_params_xgb):
+    print(f"    {X_train.columns[i]}: {param:.4f}")
+
+print("\nHITL Bayesian Optimization:")
+print(f"  Best Quality: {best_quality_hitl:.4f}")
+print("  Best Profile:")
+for i, param in enumerate(best_params_hitl):
+    print(f"    {X_train.columns[i]}: {param:.4f}")
+
+# --- Analysis ---
+print("\n--- Analysis ---")
+if best_quality_hitl > best_quality_xgb:
+    print("The HITL approach found a wine profile with a higher predicted quality.")
+    print(f"Quality improvement: {best_quality_hitl - best_quality_xgb:.4f}")
+else:
+    print("The original Bayesian optimization found a wine profile with a slightly better or equal quality.")
+
+print("\nBy observing the convergence plot, we can analyze which method converged faster to a high-quality solution.")
+print("The HITL approach, by incorporating user preferences, can sometimes explore more promising regions of the search space, potentially leading to faster discovery of high-quality profiles.")
