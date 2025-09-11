@@ -65,3 +65,8 @@ To add a new experiment for a different dataset:
 10. Update the `README.md` to include the new notebook.
 
 When adding code, please maintain the structure of using `#%% md` cells in the Python scripts to separate logical sections, similar to the existing scripts.
+
+## Coding Standards
+
+- When using jupytext, use --update to avoid overwriting existing metadata.
+- Follow PEP 8 style guidelines for Python code.
