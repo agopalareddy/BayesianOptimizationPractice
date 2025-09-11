@@ -31,10 +31,10 @@ X_train, X_test, y_train, y_test = train_test_split(X, y, test_size=0.2, random_
 #%%
 import pandas as pd
 # Display the first few rows of the features and target
-display(X_train.head())
-display(y_train.head())
-display(X_test.head())
-display(y_test.head())
+print(X_train.head())
+print(y_train.head())
+print(X_test.head())
+print(y_test.head())
 #%%
 # Display the shape of the features and target
 print(f"Shape of X_train: {X_train.shape}")
